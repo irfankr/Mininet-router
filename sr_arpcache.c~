@@ -65,7 +65,7 @@ void handle_arpreq(struct sr_instance *sr, struct sr_arpreq *req){
           ip_header->ip_sum = cksum(ip_header, sizeof(sr_ip_hdr_t));
 
           /* Saljemo ICMP Network Unreachable */
-          salji_icmp_odgovor(sr, sizeof(pkt->buf), 1, pkt->iface, icmp_type_dest_unreachable, icmp_code_d_net_un);
+          salji_icmp_odgovor(sr, pkt->buf, 1, pkt->iface, icmp_type_dest_unreachable, icmp_code_d_net_un);
         
         pkt = pkt->next;
       }
