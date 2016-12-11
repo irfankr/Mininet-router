@@ -1,0 +1,531 @@
+/**********************************************************************
+ * file:  sr_router.c
+ * date:  Mon Feb 18 12:50:42 PST 2002
+ * Contact: casado@stanford.edu
+ *
+ * Description:
+ *
+ * This file contains all the functions that interact directly
+ * with the routing table, as well as the main entry method
+ * for routing.
+ *
+ **********************************************************************/
+
+#include <stdio.h>
+#include <assert.h>
+
+
+#include "sr_if.h"
+#include "sr_rt.h"
+#include "sr_router.h"
+#include "sr_protocol.h"
+#include "sr_arpcache.h"
+#include "sr_utils.h"
+
+/* --------------------------------------------------------------------- */
+/* Funkcija koja vraca strukturu o detaljima routiranja.
+    Nexthop IP adresu, Interface na koji se proslijediti paket te da li je pronasla interface */
+struct detalji_routiranja prikaz_detalja_routiranja(struct sr_instance*, uint32_t);
+/* --------------------------------------------------------------------- */
+
+/*---------------------------------------------------------------------
+ * Method: sr_init(void)
+ * Scope:  Global
+ *
+ * Initialize the routing subsystem
+ *
+ *---------------------------------------------------------------------*/
+void sr_init(struct sr_instance* sr)
+{
+    /* REQUIRES */
+    assert(sr);
+
+    /* Initialize cache and cache cleanup thread */
+    sr_arpcache_init(&(sr->cache));
+
+    pthread_attr_init(&(sr->attr));
+    pthread_attr_setdetachstate(&(sr->attr), PTHREAD_CREATE_JOINABLE);
+    pthread_attr_setscope(&(sr->attr), PTHREAD_SCOPE_SYSTEM);
+    pthread_attr_setscope(&(sr->attr), PTHREAD_SCOPE_SYSTEM);
+    pthread_t thread;
+
+    pthread_create(&thread, &(sr->attr), sr_arpcache_timeout, sr);
+    
+    /* Add initialization code here! */
+
+} /* -- sr_init -- */
+
+
+const uint32_t m1  = 0x5555555555555555; /* binary: 0101... */
+const uint32_t m2  = 0x3333333333333333; /* binary: 00110011.. */
+const uint32_t m4  = 0x0f0f0f0f0f0f0f0f; /* binary:  4 zeros,  4 ones ... */
+const uint32_t m8  = 0x00ff00ff00ff00ff; /* binary:  8 zeros,  8 ones ... */
+const uint32_t m16 = 0x0000ffff0000ffff; /* binary: 16 zeros, 16 ones ... */
+const uint32_t m32 = 0x00000000ffffffff; /* binary: 32 zeros, 32 ones */
+
+int popcount_1(uint32_t x) {
+    x = (x & m1 ) + ((x >>  1) & m1 ); /* put count of each  2 bits into those  2 bits */
+    x = (x & m2 ) + ((x >>  2) & m2 ); /* put count of each  4 bits into those  4 bits */ 
+    x = (x & m4 ) + ((x >>  4) & m4 ); /* put count of each  8 bits into those  8 bits */
+    x = (x & m8 ) + ((x >>  8) & m8 ); /* put count of each 16 bits into those 16 bits */
+    x = (x & m16) + ((x >> 16) & m16); /* put count of each 32 bits into those 32 bits */
+    return x;
+}
+
+
+
+/*---------------------------------------------------------------------
+ * Method: salji_icmp_odgovor
+ * Scope:  Global
+ *
+ * Funkcija koju pozivamo pri zauzimanju memorije i kreiranju
+ * ICMP poruke.
+ *---------------------------------------------------------------------*/
+void salji_icmp_odgovor(
+  struct sr_instance* sr, 
+  uint8_t * packet/* lent */, 
+  unsigned int len, 
+  char* interface,/* lent */
+  uint16_t ulazni_tip,
+  uint16_t ulazni_kod
+  
+){
+
+  struct sr_ethernet_hdr *ether_hdr_naseg_paketa = 0;
+  struct sr_ip_hdr *ip_hdr_naseg_paketa = 0;
+  struct sr_icmp_hdr *icmp_hdr_naseg_paketa = 0;
+  struct sr_ip_hdr *icmp_ip_data_naseg_paketa = 0;
+
+  struct sr_ethernet_hdr *ether_hdr = 0;
+  struct sr_ip_hdr *ip_hdr = 0;
+  struct sr_icmp_hdr *icmp_hdr = 0;
+
+  uint8_t *new_packet; /* Novi paket */
+
+  int duzina_dijela_chks = 0;
+
+  ether_hdr = (struct sr_ethernet_hdr*)packet;
+  ip_hdr = (sr_ip_hdr_t*)(packet+sizeof(sr_ethernet_hdr_t));
+
+  
+  if(ulazni_tip == icmp_type_reply){
+    /* ******* ICMP Echo Reply Message, Type:0, Code:0 ******* */
+    /* ******************************************************* */
+
+    /* Dinamicka alokacija memorije za novi paket */
+    new_packet = (uint8_t*)calloc(1, len);
+
+    /* Kopiramo Data iz ICMP paketa koji je stigao */  
+    memcpy(
+      new_packet + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_hdr_t),
+      packet + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_hdr_t),
+      len - sizeof(sr_ethernet_hdr_t) - sizeof(sr_ip_hdr_t) - sizeof(sr_icmp_hdr_t)
+    );
+
+    /* ******************************************************* */
+  } else if(ulazni_tip == icmp_type_dest_unreachable || ulazni_tip == icmp_type_time_excd){
+    /* Destination Unreachable Message (Type:3) i Time exceeded Message (Type:11)  */
+    /* [Destination Unreachable Type:3] / Port Unreachable (Code:3) / Net unreachable (Code:0) / Host Unreachable (Code:1) */
+    /* [Time exceeded Message Type:11, Code:0] */
+    /* ******************************************************************************************************************* */
+
+    /* Racunamo duzinu paketa */
+    len = sizeof(sr_ethernet_hdr_t) + 2 * sizeof(sr_ip_hdr_t) + 2 * sizeof(sr_icmp_hdr_t) + 8;
+
+    /* Dinamicka alokacija memorije za novi paket */
+    new_packet = (uint8_t*)calloc(1, len);
+
+    /* Kopiramo IP header u ICMP data i 64 bita */
+    memcpy(
+      new_packet + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + 2 * sizeof(sr_icmp_hdr_t),
+      packet + sizeof(sr_ethernet_hdr_t), 
+      sizeof(sr_ip_hdr_t) + 8
+    );
+
+    /* Definiramo IP zaglavlje u ICPM data */
+    icmp_ip_data_naseg_paketa = (struct sr_ip_hdr*)(new_packet + (sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + 2*sizeof(sr_icmp_hdr_t)));
+
+    /* Racunamo Checksum IP zaglavlja u ICMP data */
+    icmp_ip_data_naseg_paketa->ip_sum = 0x000;
+    icmp_ip_data_naseg_paketa->ip_sum = cksum(icmp_ip_data_naseg_paketa, sizeof(sr_ip_hdr_t));
+
+    /* ******************************************************************************************************************* */
+  }
+   
+
+  /* Definiramo Ethernet zaglavlje */
+  ether_hdr_naseg_paketa = (struct sr_ethernet_hdr*)new_packet;
+
+  /* Definiramo IP zaglavlje */
+  ip_hdr_naseg_paketa = (struct sr_ip_hdr*)(new_packet + sizeof(sr_ethernet_hdr_t));
+  /* Definiramo ICMP zaglavlje */
+  icmp_hdr_naseg_paketa = (struct sr_icmp_hdr*)(new_packet + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t));
+  
+  /* Mijenjamo vrijednosti u Ethernet zaglavlju */
+  ether_hdr_naseg_paketa->ether_type = ntohs(ethertype_ip);
+
+  /* Mijenjamo vrijednosti u IP zaglavlju */
+  ip_hdr_naseg_paketa->ip_dst = ip_hdr->ip_src;
+  
+  ip_hdr_naseg_paketa->ip_p = ip_protocol_icmp;
+  ip_hdr_naseg_paketa->ip_ttl = icmp_ttl_reply;
+  ip_hdr_naseg_paketa->ip_v = IP_VERZIJA;
+  ip_hdr_naseg_paketa->ip_hl = IP_HDR_DUZINA;
+  ip_hdr_naseg_paketa->ip_len = ntohs(len - sizeof(sr_ethernet_hdr_t)); /* Duzina datagrama paketa */
+
+  /* Mijenjamo vrijednosti u ICMP zaglavlju */    
+  icmp_hdr_naseg_paketa->icmp_type = ulazni_tip; /* Mijenjamo ICMP Type */
+  icmp_hdr_naseg_paketa->icmp_code = ulazni_kod; /* Mijenjamo ICMP Type */
+
+    /* Racunanje Checksuma ICMP */
+    icmp_hdr_naseg_paketa->icmp_sum = 0x000;
+    duzina_dijela_chks = len - sizeof(struct sr_ethernet_hdr) - sizeof(struct sr_ip_hdr);
+    uint16_t* priv_vrj_chesksum = (uint16_t *) (new_packet + sizeof (struct sr_ethernet_hdr) + sizeof(struct sr_ip_hdr));
+    icmp_hdr_naseg_paketa->icmp_sum = cksum(priv_vrj_chesksum, duzina_dijela_chks);
+
+  /* Slanje paketa */
+
+  /* Kako je ICMP poruka zapravo IP paket, izvrsicemo routiranje ovog paketa */
+  /* Na osnovu IP adrese iz destinacije paketa, pozivamo funkciju da saznamo na koji cemo interface poslati paket */  
+  struct detalji_routiranja det_rout = prikaz_detalja_routiranja(sr, ip_hdr_naseg_paketa->ip_dst);
+
+  /* Kao source IP ovog ICMP paketa postavljamo IP adresu ovog interfacea */
+  ip_hdr_naseg_paketa->ip_src = vrati_ip_adresu_source_interfejsa_routera(sr, det_rout.interface_poslati);
+
+  /* Vrsimo routiranje paketa */
+  routiranje_paketa(sr, new_packet, len, interface, ip_hdr_naseg_paketa->ip_dst);
+
+  /* Oslobadjamo zauzetu memoriju */
+  free(new_packet);
+
+} /* -- salji_icmp_odgovor -- */
+
+
+/*---------------------------------------------------------------------
+ * Method: sr_handlepacket(uint8_t* p,char* interface)
+ * Scope:  Global
+ *
+ * This method is called each time the router receives a packet on the
+ * interface.  The packet buffer, the packet length and the receiving
+ * interface are passed in as parameters. The packet is complete with
+ * ethernet headers.
+ *
+ * Note: Both the packet buffer and the character's memory are handled
+ * by sr_vns_comm.c that means do NOT delete either.  Make a copy of the
+ * packet instead if you intend to keep it around beyond the scope of
+ * the method call.
+ *
+ *---------------------------------------------------------------------*/
+
+void sr_handlepacket(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned int len, char* interface/* lent */){
+  struct sr_ethernet_hdr *ether_hdr = 0;
+  struct sr_arp_hdr *arp_hdr = 0;
+  struct sr_ip_hdr *ip_hdr = 0;
+  struct sr_icmp_hdr *icmp_hdr = 0;
+  int duzina_dijela_chks = 0;
+  
+  uint32_t temp_ip;
+
+  /* REQUIRES */ 
+  assert(sr); 
+  assert(packet); 
+  assert(interface);
+
+  printf("*** -> Primljen paket duzine: %d \n",len);
+
+  /* Definiramo ethernet zaglavlje */
+  ether_hdr = (struct sr_ethernet_hdr*)packet;
+ 
+  /**************************** Provjera da li je rijec o ARP protokolu ****************************/
+  if(ntohs(ether_hdr->ether_type) == ethertype_arp){ 
+
+    arp_hdr = (sr_arp_hdr_t*)(packet+sizeof(sr_ethernet_hdr_t));
+
+    /* Provjera da li je rijec o interfejsu routera */
+    if(sr_provjeriIP(sr, arp_hdr->ar_tip) == true){
+
+      /* Provjera da li je rijec o ARP zahtjevu */
+      if (arp_hdr->ar_op == htons(arp_op_request)){
+
+        /* Koristimo primljeni ARP zahtjev da upisemo IP-MAC mapiranje u ARP cache */
+        struct sr_arpreq * req = sr_arpcache_insert(&(sr->cache), arp_hdr->ar_sha, arp_hdr->ar_sip);
+           
+        arp_hdr->ar_op = htons(arp_op_reply); /* Postavljamo ovom paketu da je ARP odgovor */
+
+        /* Izmjena ARP zaglavlja */
+        temp_ip = arp_hdr->ar_tip;
+        arp_hdr->ar_tip = arp_hdr->ar_sip; /* Destinacijska IP postaje izvorisna IP */
+        arp_hdr->ar_sip = temp_ip; /* Izvorisna IP postaje temp_ip (maloprije odredisna) */
+    
+        memcpy(arp_hdr->ar_tha, arp_hdr->ar_sha, sizeof(arp_hdr->ar_sha)); /* Fizicka adresa destinacijska postaje izvorisna od maloprije */
+        memcpy(arp_hdr->ar_sha, sr_get_interface(sr,interface)->addr, sizeof(sr_get_interface(sr,interface)->addr)); /* Fizicka izvorisna adresa postaje navedena adresa interfejsa */
+            
+        /* Izmjena Ethernet zaglavlja */
+        memcpy(ether_hdr->ether_dhost, ether_hdr->ether_shost, sizeof(ether_hdr->ether_shost)); /* Fizicka adresa destinacijska postaje izvorisna od maloprije */
+             
+        /* Fizicka izvorisna adresa postaje navedena adresa interfejsa*/       
+        memcpy(ether_hdr->ether_shost, sr_get_interface(sr,interface)->addr, sizeof(sr_get_interface(sr,interface)->addr));
+
+        /* Vracamo paket nazad */
+        sr_send_packet(sr, packet, len, interface);
+
+      } else {
+        /* U slucaju da smo primili ARP odgovor */
+
+        /* Kada je stigao ARP odgovor ubacujemo IP-MAC mapiranje u ARP cache */
+        struct sr_arpreq * req = sr_arpcache_insert(&(sr->cache), arp_hdr->ar_sha, arp_hdr->ar_sip);
+
+        /* Saljemo sve pakete iz ARP reda cekanja koji cekaju na ovo mapiranje */
+        if(req != 0){
+            struct sr_packet *pkt = req->packets;
+            while(pkt != 0){
+              /* Definiramo IP zaglavlje */
+              struct sr_ip_hdr *ip_hdr = 0;
+              ip_hdr = (sr_ip_hdr_t*)((pkt->buf) + sizeof(sr_ethernet_hdr_t));
+
+              /* Pozivamo funkciju da saznamo na koji cemo interface poslati paket (na osnovu IP adrese iz destinacije paketa) */  
+              struct detalji_routiranja det_rout = prikaz_detalja_routiranja(sr, ip_hdr->ip_dst);
+
+              /* Saljemo paket */
+              routiranje_paketa(sr, pkt->buf, pkt->len, pkt->iface, det_rout.nexthop_ip);
+
+              /* Prelazimo na sljedeci paket */
+              pkt = pkt->next;
+           }
+        }
+
+        /* Unistavamo sve zahtjeve u ARP redu cekanja koji cekaju na takvo mapiranje */
+        sr_arpreq_destroy(&(sr->cache), req);
+
+      }
+
+  }
+
+
+  /**************************** Provjera da li je rijec o IP protokolu ****************************/
+  } else if (ntohs(ether_hdr->ether_type) == ethertype_ip){ 
+    
+    ip_hdr = (sr_ip_hdr_t*)(packet+sizeof(sr_ethernet_hdr_t));
+
+    /* Provjera Cheksuma pristiglog paketa IP zaglavlja */
+    uint16_t stari_ip_checksum = ip_hdr->ip_sum;
+    ip_hdr->ip_sum=0x000;
+    if(cksum(ip_hdr, sizeof(sr_ip_hdr_t)) == stari_ip_checksum){
+    
+      /* Provjera je li paket namjenjen interfejsu routera */
+      if(sr_provjeriIP(sr, ip_hdr->ip_dst) == true){
+
+          /* Provjera radi li se o ICMP protokolu */
+          if (ip_hdr->ip_p == ip_protocol_icmp){
+            icmp_hdr = (sr_icmp_hdr_t*) (packet + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t));  
+
+            /* Provjera Cheksuma pristiglog paketa ICMP zaglavlja */
+            uint16_t stari_icmp_checksum = icmp_hdr->icmp_sum;
+            icmp_hdr->icmp_sum=0x000;
+            if(cksum(icmp_hdr, len - sizeof(sr_ethernet_hdr_t) - sizeof(sr_ip_hdr_t)) == stari_icmp_checksum){ 
+            
+              /* Provjera radi li se o ICMP requestu */
+              if (icmp_hdr->icmp_type == icmp_type_request && icmp_hdr->icmp_code == icmp_code_request){
+
+                /* Pozivamo funkciju koja ce poslati ICMP odgovor */
+                salji_icmp_odgovor(sr, packet, len, interface, icmp_type_reply, icmp_code_reply);
+      
+              }
+
+            }
+
+          } else { /* Provjera radi li se o TCP ili UDP protokolu */
+
+             /* Pozivamo funkciju koja ce poslati Port Unreachable poruku (ukoliko je na interface routera primljen TCP ili UDP paket */
+             salji_icmp_odgovor(sr, packet, len, interface, icmp_type_dest_unreachable, icmp_code_port_un);
+
+          }
+
+
+      } else {
+      /* Ukoliko paket nije namjenjen interfejsu routera */
+        
+          /* Provjera vrijednosti TTL parametra (da li je veci od 1) */
+          if(ip_hdr->ip_ttl > 1){
+
+              /* Pozivamo funkciju da saznamo na koji cemo interface poslati paket */  
+              struct detalji_routiranja det_rout = prikaz_detalja_routiranja(sr, ip_hdr->ip_dst);
+
+              /* Provjera je li pronasao interface na koji ce poslati paket  */
+              /* Interface na koji saljemo paket se mora razlikovati od interfacea preko kojeg je paket dosao!!!! */
+              if(det_rout.interface_pronadjen == 0 || strcmp(det_rout.interface_poslati, interface) == 0){
+
+                /* Ukoliko NIJE pronasao na koji ce interface poslati, salje ICMP poruku Net Unreachable */
+                salji_icmp_odgovor(sr, packet, len, interface, icmp_type_dest_unreachable, icmp_code_d_net_un);
+
+              } else {
+
+                /* Smanjujemo vrijednost TTL polja za 1 */
+                ip_hdr->ip_ttl--; 
+
+                /* Ukoliko je pronasao na koji ce interface poslati vrsi routiranje paketa */
+                routiranje_paketa(sr, packet, len, interface, det_rout.nexthop_ip);
+
+              }
+
+          } else {
+
+            /* Vrijednost TTL parametra je jednaka 0, te vracamo ICMP poruku (Time Exceeded) jer se ovaj paket unistava */
+            salji_icmp_odgovor(sr, packet, len, interface, icmp_type_time_excd, icmp_code_time_excd);
+
+          }          
+
+      }
+
+    }
+
+  }   
+
+}/* end sr_ForwardPacket */
+
+
+/*---------------------------------------------------------------------
+ * Method: prikaz_detalja_routiranja
+ * Scope:  Global
+ *
+ * Funkcija koja vraca strukturu o detaljima routiranja.
+    Nexthop IP adresu, Interface na koji se proslijediti paket te da li je pronasla interface
+ *---------------------------------------------------------------------*/
+struct detalji_routiranja prikaz_detalja_routiranja(struct sr_instance* sr, uint32_t ulaznip_dst_ip){
+  /* -- Pronalazenje adrese sa najduzim poklapanjem -- */
+  struct sr_rt* rt_walker_kroz_rtable = 0;
+  rt_walker_kroz_rtable = sr->routing_table;
+
+  /* Struktura detalja routiranja */
+  struct detalji_routiranja temp_detalji_r;
+
+  /* -- REQUIRES -- */
+  assert(rt_walker_kroz_rtable);
+  assert(rt_walker_kroz_rtable->interface);
+
+  /* Broj jedinica subnet maske */
+  int br_jedinica_subnet = 0;
+
+  /* Da li je pronadjen interface */
+  temp_detalji_r.interface_pronadjen = 0; /* Pretpostavimo da je na pocetku false tj. 0 */
+
+  /* Idemo kroz svaku vrijednost iz routing tabele */
+  do {
+    /* Subnet maska mreze */
+    uint32_t subnet_maska_mreze = (rt_walker_kroz_rtable->mask).s_addr; 
+
+    /* Adresa gatewaya */
+    uint32_t ip_dest_rtable = (rt_walker_kroz_rtable->gw).s_addr; 
+
+    /* Provjera jesu li iste */
+    if((subnet_maska_mreze & ulaznip_dst_ip) == (subnet_maska_mreze & ip_dest_rtable)){
+      /* Prebrojavamo broj jedinica subnet maske AKO JE VECI OD br_jedinica_subnet ONDA PROMJENITI NA KOJI SE SALJE INT I BR JED  */
+      if(popcount_1(subnet_maska_mreze) >= br_jedinica_subnet){
+        /* Postavljamo koliko 1 ima subnet maska */
+        br_jedinica_subnet = popcount_1(subnet_maska_mreze);
+        /* Postavljamo na koji interface salje */
+        memcpy(temp_detalji_r.interface_poslati, rt_walker_kroz_rtable->interface, sr_IFACE_NAMELEN);
+        /* Postavljamo koja je to next hop adresa */
+        temp_detalji_r.nexthop_ip = ip_dest_rtable;
+        /* Postavljamo varijablu pronadjen_interfejs da je pronadjen BAR JEDAN interface */
+        temp_detalji_r.interface_pronadjen = 1;
+      }
+    }    
+
+    /* Setamo kroz strukturu sve vrijednosti rtable */
+    rt_walker_kroz_rtable = rt_walker_kroz_rtable->next; 
+  } while(rt_walker_kroz_rtable); 
+  /* Vracamo da li je pronadjen interface na koji ce se poslati */
+  return temp_detalji_r;
+}/* end prikaz_detalja_routiranja */
+
+
+/*---------------------------------------------------------------------
+ * Method: routiranje_paketa
+ * Scope:  Global
+ *
+ * Funkcija koja rutira
+ * 
+ *---------------------------------------------------------------------*/
+void routiranje_paketa(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned int len, char* interface/* lent */, uint32_t ulazni_p_next_hop_ip){
+
+  /* Gledamo ARP cache postoji li IP-MAC mapiranje */
+  struct sr_arpentry *req = sr_arpcache_lookup(&(sr->cache), ulazni_p_next_hop_ip);
+
+  /* Ukoliko nije pronadjen zapis u ARP tabeli, poslati ARP zahtjev */
+  if (!req) {
+
+    struct sr_arpcache *req_provjera_kes = &(sr->cache);
+    struct sr_arpreq *req_provjera;
+    pthread_mutex_lock(&(req_provjera_kes->lock));
+
+    int pronasao_mapiranje = 0; /* Pocetna vrijednost da nije pronasao mapiranje */
+
+    /* Provjeravamo postoji li za ovo mapiranje vec paket u redu cekanja, tj. da li je vec poslan ARP zahtjev */
+    /* Ako nema ODMAH saljemo ARP zahtjev, ako ima onda se ne salje ARP zahtjev u ovom koraku */
+    for (req_provjera = req_provjera_kes->requests; req_provjera != NULL; req_provjera = req_provjera->next) {
+        if (req_provjera->ip == ulazni_p_next_hop_ip) {
+            pronasao_mapiranje = 1;
+            break;
+        }
+    } 
+
+    /* Ubacujemo paket u ARP red cekanja */
+    struct sr_arpreq *req;
+    req = sr_arpcache_queuereq(&(sr->cache), ulazni_p_next_hop_ip, packet, len, interface);
+
+    /* Ako nije nasao postojeci zapis u ARP redu cekanja salje ODMAH arp zahtjev */
+    if (pronasao_mapiranje == 0) {
+      time_t trenutnovrijeme = time(NULL);
+      posalji_arp_zahtjev(sr, req->ip);
+      req->sent = trenutnovrijeme;
+      req->times_sent++;
+    }
+
+    pthread_mutex_unlock(&(req_provjera_kes->lock));
+
+  } else {
+    /* Pronadjeno je mapiranje IP->MAC te vrsimo slanje paketa */
+
+    /* Iz mapiranja uzimamo MAC adresu */
+    struct sr_arpcache *cache = &(sr->cache);
+    pthread_mutex_lock(&(cache->lock));
+
+    int i;
+    uint8_t mac_adresa_mapiranja[ETHER_ADDR_LEN];
+    for (i = 0; i < SR_ARPCACHE_SZ; i++) {
+        if ((cache->entries[i].valid) && (cache->entries[i].ip == ulazni_p_next_hop_ip)) {
+            memcpy(mac_adresa_mapiranja, cache->entries[i].mac, ETHER_ADDR_LEN);
+        }
+    }
+
+    /* Na osnovu IP adrese iz mapiranja pomocu funkcije saznajemo na koji interface treba izbaciti paket */
+    /* Pozivamo funkciju da saznamo na koji cemo interface poslati paket */
+    struct detalji_routiranja det_rout = prikaz_detalja_routiranja(sr, ulazni_p_next_hop_ip);
+
+    pthread_mutex_unlock(&(cache->lock));
+
+    /* Modificiramo parametre paketa te vrsimo prosledjivanje */
+
+    /* Definiramo Ethernet i IP zaglavlje */
+    struct sr_ethernet_hdr *ether_hdr = 0;
+    struct sr_ip_hdr *ip_hdr = 0;
+    ether_hdr = (struct sr_ethernet_hdr*)packet;
+    ip_hdr = (sr_ip_hdr_t*)(packet + sizeof(sr_ethernet_hdr_t));
+
+    /* Modificiramo Ethernet zaglavlje */
+    memcpy(ether_hdr->ether_shost, vrati_mac_adresu_interfejsa_routera(sr, det_rout.interface_poslati), 6 * sizeof(uint8_t)); /* Izvorisna MAC */
+    memcpy(ether_hdr->ether_dhost, mac_adresa_mapiranja, 6 * sizeof(uint8_t)); /* Destinacijska MAC */
+
+    /* Modificiramo IP zaglavlje */
+      /* Racunamo opet IP checksum posto smo promjenili vrijednost TTL */
+      ip_hdr->ip_sum = 0x000;
+      int duzina_dijela_chks = sizeof(struct sr_ip_hdr);
+      uint16_t* priv_vrj_chesksum_ip = (uint16_t *) (packet + sizeof (struct sr_ethernet_hdr));
+      ip_hdr->ip_sum = cksum(priv_vrj_chesksum_ip, duzina_dijela_chks);
+
+    /* Saljemo paket */
+    sr_send_packet(sr, packet, len, det_rout.interface_poslati);
+  }
+
+}/* end routiranje_paketa */
