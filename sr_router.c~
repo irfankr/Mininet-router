@@ -13,7 +13,6 @@
 
 #include <stdio.h>
 #include <assert.h>
-#include <stdbool.h>
 
 
 #include "sr_if.h"
@@ -22,6 +21,7 @@
 #include "sr_protocol.h"
 #include "sr_arpcache.h"
 #include "sr_utils.h"
+#include <stdbool.h>
 
 /* --------------------------------------------------------------------- */
 /* Funkcija koja vraca strukturu o detaljima routiranja.
